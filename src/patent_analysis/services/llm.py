@@ -7,7 +7,6 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from ..config import OpenRouterConfig
-from ..models import SuggestionCandidate
 
 
 class OpenRouterClient:
@@ -131,39 +130,3 @@ class OpenRouterClient:
             self.last_error = f"Could not parse structured JSON: {exc}"
             return None
 
-    def generate_suggestions(self, prompt: str) -> list[SuggestionCandidate]:
-        content = self.generate_text(
-            system_prompt=(
-                "You generate structured patent design-around suggestions. "
-                "Return only a JSON array with up to three objects. "
-                "Each object must contain suggestion_text, rationale, and feasibility_note."
-            ),
-            user_prompt=prompt,
-            temperature=0.2,
-        )
-        if not content:
-            return []
-
-        try:
-            suggestions = json.loads(self._extract_json_string(content))
-        except json.JSONDecodeError as exc:
-            self.last_error = f"Could not parse suggestion JSON: {exc}"
-            return []
-
-        results: list[SuggestionCandidate] = []
-        for item in suggestions:
-            if not isinstance(item, dict):
-                continue
-            suggestion_text = str(item.get("suggestion_text", "")).strip()
-            rationale = str(item.get("rationale", "")).strip()
-            feasibility_note = str(item.get("feasibility_note", "")).strip()
-            if not suggestion_text or not rationale:
-                continue
-            results.append(
-                SuggestionCandidate(
-                    suggestion_text=suggestion_text,
-                    rationale=rationale,
-                    feasibility_note=feasibility_note or "Engineering review required.",
-                )
-            )
-        return results[:3]

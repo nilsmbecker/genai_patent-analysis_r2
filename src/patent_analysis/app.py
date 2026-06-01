@@ -1,272 +1,235 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .bootstrap import bootstrap_demo_data, import_patent_document, import_product_design
 from .config import Settings, load_settings
-from .database import initialize_database
-from .models import PatentDocumentInput, ProductDesignInput
-from .repository import PatentAnalysisRepository
-from .services.extraction import FeatureExtractor
-from .services.innovation import InnovationService
+from .repository import PatentRepository
+from .runtime import build_runtime
+from .services.agent_conflict import ConflictAnalysisAgent
+from .services.agent_design import DesignImprovementAgent
+from .services.agent_extraction import PatentExtractionAgent
+from .services.agent_innovation import InnovationOpportunityAgent
 from .services.llm import OpenRouterClient
-from .services.normalization import TextNormalizer
-from .services.risk import RiskAnalyzer
-from .services.suggestions import SuggestionService
 
 
-PACKAGE_DIR = Path(__file__).resolve().parent
+PACKAGE_DIR  = Path(__file__).resolve().parent
 TEMPLATES_DIR = PACKAGE_DIR / "templates"
-STATIC_DIR = PACKAGE_DIR / "static"
-
-
-@dataclass(slots=True)
-class ServiceContainer:
-    settings: Settings
-    repository: PatentAnalysisRepository
-    extractor: FeatureExtractor
-    risk_analyzer: RiskAnalyzer
-    suggestion_service: SuggestionService
-    innovation_service: InnovationService
+STATIC_DIR    = PACKAGE_DIR / "static"
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
-    if settings.app.auto_init_db:
-        initialize_database(settings.database.path)
+    runtime  = build_runtime(settings)
+    repo     = runtime.repository
+    llm      = runtime.llm_client
 
-    repository = PatentAnalysisRepository(settings.database.path)
-    normalizer = TextNormalizer(settings.analysis.canonical_terms)
-    llm_client = OpenRouterClient(settings.openrouter)
-    extractor = FeatureExtractor(settings, normalizer, llm_client)
-    services = ServiceContainer(
-        settings=settings,
-        repository=repository,
-        extractor=extractor,
-        risk_analyzer=RiskAnalyzer(settings, normalizer),
-        suggestion_service=SuggestionService(llm_client),
-        innovation_service=InnovationService(),
-    )
-
-    bootstrap_demo_data(settings, repository, extractor)
+    agents = {
+        "extraction": PatentExtractionAgent(llm),
+        "conflict":   ConflictAnalysisAgent(llm),
+        "design":     DesignImprovementAgent(llm),
+        "innovation": InnovationOpportunityAgent(llm),
+    }
 
     app = FastAPI(title=settings.app.name)
-    app.state.services = services
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
-    def render_template(request: Request, name: str, context: dict) -> HTMLResponse:
-        base_context = {
-            "request": request,
-            "app_name": settings.app.name,
-        }
-        base_context.update(context)
-        return templates.TemplateResponse(request=request, name=name, context=base_context)
+    def render(request: Request, name: str, ctx: dict) -> HTMLResponse:
+        ctx.setdefault("app_name", settings.app.name)
+        ctx.setdefault("request", request)
+        return templates.TemplateResponse(request=request, name=name, context=ctx)
+
+    def enrich_patents(patents: list[dict]) -> list[dict]:
+        for p in patents:
+            cached = repo.get_agent_result(int(p["id"]), "extraction")
+            if cached and "result" in cached:
+                meta    = cached["result"].get("meta", {}) or {}
+                details = cached["result"].get("details", {}) or {}
+                risk_text = details.get("risk_analysis") or ""
+                risk_level = next(
+                    (lvl for lvl in ("Critical", "High", "Medium", "Low")
+                     if lvl.lower() in risk_text.lower()), ""
+                )
+                features = [f for f in (details.get("key_technical_features") or []) if f]
+                p["ex_patentee"]  = meta.get("patentee") or ""
+                p["ex_date"]      = meta.get("application_date") or ""
+                p["ex_status"]    = meta.get("legal_status") or ""
+                p["ex_risk"]      = risk_level
+                p["ex_features"]  = features[:5]
+                p["ex_feat_text"] = " ".join(features).lower()
+            else:
+                p["ex_patentee"]  = ""
+                p["ex_date"]      = ""
+                p["ex_status"]    = ""
+                p["ex_risk"]      = ""
+                p["ex_features"]  = []
+                p["ex_feat_text"] = ""
+        return patents
+
+    # ── Redirect root → analyze ───────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
-    async def dashboard(request: Request):
-        metrics = repository.get_dashboard_metrics()
-        recent_patents = repository.list_patents(limit=5)
-        recent_assessments = repository.list_recent_assessments(limit=5)
-        latest_innovation = repository.get_latest_innovation_insight()
-        return render_template(
-            request,
-            "dashboard.html",
-            {
-                "title": "Dashboard",
-                "metrics": metrics,
-                "recent_patents": recent_patents,
-                "recent_assessments": recent_assessments,
-                "latest_innovation": latest_innovation,
-                "nav": "dashboard",
-                "settings_path": str(settings.config_path.relative_to(settings.root_dir)),
-            },
-        )
+    async def root():
+        return RedirectResponse(url="/analyze")
 
-    @app.get("/patents", response_class=HTMLResponse)
-    async def patent_list(request: Request, q: str = ""):
-        patents = repository.list_patents(q)
-        return render_template(
-            request,
-            "patents.html",
-            {"title": "Patents", "patents": patents, "query": q, "nav": "patents"},
-        )
+    # ── Analysis dashboard ────────────────────────────────────
 
-    @app.post("/patents")
-    async def create_patent(
-        title: str = Form(...),
-        patent_number: str = Form(""),
-        source: str = Form("manual-entry"),
-        partner_domain: str = Form("automotive glazing"),
-        abstract_text: str = Form(""),
-        claims_text: str = Form(""),
-        description_text: str = Form(""),
-    ):
-        if not any(text.strip() for text in (abstract_text, claims_text, description_text)):
-            raise HTTPException(status_code=400, detail="At least one patent section is required.")
+    @app.get("/analyze", response_class=HTMLResponse)
+    async def analyze_home(request: Request):
+        return render(request, "analyze.html", {
+            "title": "Analysis Dashboard",
+            "patents": enrich_patents(repo.list_patents(limit=200)),
+            "patent_id": None,
+            "selected": None,
+            "has_pdf": False,
+            "agent_results_json": "{}",
+            "nav": "analyze",
+        })
 
-        document = PatentDocumentInput(
-            title=title,
-            patent_number=patent_number,
-            source=source,
-            partner_domain=partner_domain,
-            sections={
-                "abstract": abstract_text,
-                "claims": claims_text,
-                "description": description_text,
-            },
-        )
-        try:
-            patent_id = import_patent_document(repository, extractor, document)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return RedirectResponse(url=f"/patents/{patent_id}", status_code=303)
-
-    @app.get("/patents/{patent_id}", response_class=HTMLResponse)
-    async def patent_detail(request: Request, patent_id: int):
-        detail = repository.get_patent_detail(patent_id)
-        if detail is None:
+    @app.get("/analyze/{patent_id}", response_class=HTMLResponse)
+    async def analyze_patent(request: Request, patent_id: int):
+        patent = repo.get_patent(patent_id)
+        if patent is None:
             raise HTTPException(status_code=404, detail="Patent not found.")
-        return render_template(
-            request,
-            "patent_detail.html",
-            {
-                "title": detail["patent"]["title"],
-                "detail": detail,
-                "nav": "patents",
-            },
-        )
+        agent_results = {
+            agent: repo.get_agent_result(patent_id, agent)
+            for agent in ("extraction", "conflict", "design", "innovation")
+        }
+        return render(request, "analyze.html", {
+            "title": f"Analyse — {patent['title']}",
+            "patents": enrich_patents(repo.list_patents(limit=200)),
+            "patent_id": patent_id,
+            "selected": patent,
+            "has_pdf": bool(patent.get("pdf_path")),
+            "agent_results_json": json.dumps(agent_results),
+            "nav": "analyze",
+        })
 
-    @app.get("/designs", response_class=HTMLResponse)
-    async def design_list(request: Request):
-        designs = repository.list_product_designs()
-        return render_template(
-            request,
-            "designs.html",
-            {"title": "Product Designs", "designs": designs, "nav": "designs"},
-        )
+    # ── PDF upload ────────────────────────────────────────────
 
-    @app.post("/designs")
-    async def create_design(
-        name: str = Form(...),
-        raw_description: str = Form(...),
-    ):
-        design = ProductDesignInput(name=name, raw_description=raw_description)
-        design_id = import_product_design(repository, extractor, design)
-        return RedirectResponse(url=f"/designs/{design_id}", status_code=303)
+    @app.post("/api/patents/upload-pdf")
+    async def upload_pdf(file: UploadFile = File(...)):
+        if not file.filename or not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
 
-    @app.get("/designs/{design_id}", response_class=HTMLResponse)
-    async def design_detail(request: Request, design_id: int):
-        detail = repository.get_product_design(design_id)
-        if detail is None:
-            raise HTTPException(status_code=404, detail="Product design not found.")
-        return render_template(
-            request,
-            "design_detail.html",
-            {
-                "title": detail["design"]["name"],
-                "detail": detail,
-                "nav": "designs",
-            },
-        )
+        pdf_bytes = await file.read()
+        if not pdf_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    @app.get("/analysis", response_class=HTMLResponse)
-    async def analysis_home(request: Request):
-        patents = repository.list_patents(limit=100)
-        designs = repository.list_product_designs()
-        assessments = repository.list_recent_assessments(limit=10)
-        return render_template(
-            request,
-            "analysis.html",
-            {
-                "title": "Risk Analysis",
-                "patents": patents,
-                "designs": designs,
-                "assessments": assessments,
-                "nav": "analysis",
-            },
-        )
+        upload_dir = settings.root_dir / "data" / "uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = f"{int(time.time())}_{file.filename.replace(' ', '_')}"
+        pdf_path  = upload_dir / safe_name
+        pdf_path.write_bytes(pdf_bytes)
 
-    @app.post("/analysis/run")
-    async def run_analysis(
-        product_design_id: int = Form(...),
-        patent_id: int = Form(...),
-    ):
-        design_detail_record = repository.get_product_design(product_design_id)
-        patent_detail_record = repository.get_patent_detail(patent_id)
-        if design_detail_record is None or patent_detail_record is None:
-            raise HTTPException(status_code=404, detail="Design or patent not found.")
+        title      = file.filename.removesuffix(".pdf").replace("_", " ").replace("-", " ")
+        patent_id  = repo.create_patent(title, source="pdf-upload")
+        repo.update_patent(patent_id, pdf_path=str(pdf_path))
 
-        design = design_detail_record["design"]
-        patent = patent_detail_record["patent"]
-        design_features = design_detail_record["features"]
-        patent_features = patent_detail_record["features"]
+        result = agents["extraction"].run(pdf_bytes)
+        repo.save_agent_result(patent_id, "extraction", result)
 
-        result = services.risk_analyzer.analyze(
-            design_name=design["name"],
-            patent_title=patent["title"],
-            design_features=design_features,
-            patent_features=patent_features,
-        )
-        suggestions = services.suggestion_service.build_suggestions(
-            design_name=design["name"],
-            patent_title=patent["title"],
-            risk_level=result["risk_level"],
-            matches=result["matches"],
-        )
-        assessment_id = repository.create_risk_assessment(
-            product_design_id=product_design_id,
-            patent_id=patent_id,
-            risk_score=result["risk_score"],
-            risk_level=result["risk_level"],
-            reasoning_summary=result["reasoning_summary"],
-            matches=result["matches"],
-            suggestions=suggestions,
-        )
-        return RedirectResponse(url=f"/assessments/{assessment_id}", status_code=303)
+        if "meta" in result and result["meta"]:
+            updates: dict[str, str] = {}
+            if result["meta"].get("patent_number"):
+                updates["patent_number"] = str(result["meta"]["patent_number"])
+            if result["meta"].get("patentee"):
+                updates["title"] = str(result["meta"]["patentee"])
+            if updates:
+                repo.update_patent(patent_id, **updates)
 
-    @app.get("/assessments/{assessment_id}", response_class=HTMLResponse)
-    async def assessment_detail(request: Request, assessment_id: int):
-        detail = repository.get_assessment_detail(assessment_id)
-        if detail is None:
-            raise HTTPException(status_code=404, detail="Assessment not found.")
-        return render_template(
-            request,
-            "assessment_detail.html",
-            {
-                "title": f"Assessment {assessment_id}",
-                "detail": detail,
-                "nav": "analysis",
-            },
-        )
+        return JSONResponse({"patent_id": patent_id, "result": result})
 
-    @app.get("/innovation", response_class=HTMLResponse)
-    async def innovation_page(request: Request):
-        patents_with_features = repository.list_patents_with_features()
-        live_summary = services.innovation_service.analyze(patents_with_features)
-        latest_innovation = repository.get_latest_innovation_insight()
-        return render_template(
-            request,
-            "innovation.html",
-            {
-                "title": "Innovation Opportunities",
-                "insight": live_summary,
-                "latest_innovation": latest_innovation,
-                "nav": "innovation",
-            },
-        )
+    # ── Agent endpoints ───────────────────────────────────────
 
-    @app.post("/innovation/run")
-    async def run_innovation():
-        patents_with_features = repository.list_patents_with_features()
-        insight = services.innovation_service.analyze(patents_with_features)
-        insight_id = repository.save_innovation_insight(insight)
-        return RedirectResponse(url=f"/innovation?saved={insight_id}", status_code=303)
+    @app.post("/api/patents/{patent_id}/agents/extraction")
+    async def run_extract(patent_id: int):
+        patent = repo.get_patent(patent_id)
+        if not patent or not patent.get("pdf_path"):
+            raise HTTPException(status_code=404, detail="No PDF found for this patent.")
+        pdf_bytes = Path(patent["pdf_path"]).read_bytes()
+        result = agents["extraction"].run(pdf_bytes)
+        repo.save_agent_result(patent_id, "extraction", result)
+        return JSONResponse(result)
+
+    @app.get("/api/patents/{patent_id}/agents/extraction")
+    async def get_extract(patent_id: int):
+        cached = repo.get_agent_result(patent_id, "extraction")
+        if cached is None:
+            raise HTTPException(status_code=404, detail="No extraction result yet.")
+        return JSONResponse(cached)
+
+    @app.post("/api/patents/{patent_id}/agents/conflict")
+    async def run_conflict(patent_id: int):
+        extraction = repo.get_agent_result(patent_id, "extraction")
+        if extraction is None:
+            raise HTTPException(status_code=400, detail="Run Agent 1 (extraction) first.")
+        db_patents = repo.list_patents_with_agent_results(exclude_id=patent_id)
+        result = agents["conflict"].run(extraction["result"], db_patents)
+        repo.save_agent_result(patent_id, "conflict", result)
+        return JSONResponse(result)
+
+    @app.get("/api/patents/{patent_id}/agents/conflict")
+    async def get_conflict(patent_id: int):
+        cached = repo.get_agent_result(patent_id, "conflict")
+        if cached is None:
+            raise HTTPException(status_code=404, detail="No conflict result yet.")
+        return JSONResponse(cached)
+
+    @app.post("/api/patents/{patent_id}/agents/design")
+    async def run_design(patent_id: int):
+        extraction = repo.get_agent_result(patent_id, "extraction")
+        conflict   = repo.get_agent_result(patent_id, "conflict")
+        if extraction is None:
+            raise HTTPException(status_code=400, detail="Run Agent 1 (extraction) first.")
+        if conflict is None:
+            raise HTTPException(status_code=400, detail="Run Agent 2 (conflict) first.")
+        db_patents = repo.list_patents_with_agent_results(exclude_id=patent_id)
+        result = agents["design"].run(extraction["result"], db_patents, conflict["result"])
+        repo.save_agent_result(patent_id, "design", result)
+        return JSONResponse(result)
+
+    @app.get("/api/patents/{patent_id}/agents/design")
+    async def get_design(patent_id: int):
+        cached = repo.get_agent_result(patent_id, "design")
+        if cached is None:
+            raise HTTPException(status_code=404, detail="No design result yet.")
+        return JSONResponse(cached)
+
+    @app.post("/api/patents/{patent_id}/agents/innovation")
+    async def run_innovation(patent_id: int):
+        extraction = repo.get_agent_result(patent_id, "extraction")
+        if extraction is None:
+            raise HTTPException(status_code=400, detail="Run Agent 1 (extraction) first.")
+        db_patents = repo.list_patents_with_agent_results(exclude_id=patent_id)
+        result = agents["innovation"].run(extraction["result"], db_patents)
+        repo.save_agent_result(patent_id, "innovation", result)
+        return JSONResponse(result)
+
+    @app.get("/api/patents/{patent_id}/agents/innovation")
+    async def get_innovation(patent_id: int):
+        cached = repo.get_agent_result(patent_id, "innovation")
+        if cached is None:
+            raise HTTPException(status_code=404, detail="No innovation result yet.")
+        return JSONResponse(cached)
+
+    # ── Delete patent ─────────────────────────────────────────
+
+    @app.delete("/api/patents/{patent_id}")
+    async def delete_patent(patent_id: int):
+        pdf_path = repo.delete_patent(patent_id)
+        if pdf_path:
+            try:
+                Path(pdf_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return JSONResponse({"ok": True})
 
     return app

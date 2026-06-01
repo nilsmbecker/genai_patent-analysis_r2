@@ -1,61 +1,16 @@
 [app]
-name = "Patent Analysis Prototype"
+name = "Patent Analysis"
 host = "127.0.0.1"
 port = 8000
-auto_init_db = true
-auto_seed_demo = true
-default_patent_source = "demo_json"
 
 [database]
 path = "data/patent_analysis.sqlite3"
 
-[analysis]
-minimum_feature_tokens = 3
-minimum_feature_confidence = 0.4
-medium_risk_threshold = 35.0
-high_risk_threshold = 65.0
-max_feature_matches = 6
-
-[extraction]
-enable_ai_patent_extraction = false
-ai_patent_sections = ["claims", "description"]
-fallback_to_rules = true
-max_ai_features_per_section = 8
-
-[[analysis.canonical_terms]]
-canonical = "conductive heating layer"
-variants = ["transparent conductive layer", "conductive mesh", "heating mesh", "electrical heating layer"]
-
-[[analysis.canonical_terms]]
-canonical = "edge busbar"
-variants = ["power busbar", "conductive busbar", "electrical busbar"]
-
-[[analysis.canonical_terms]]
-canonical = "temperature sensor"
-variants = ["thermal sensor", "heat sensor", "temperature feedback sensor"]
-
-[[analysis.canonical_terms]]
-canonical = "sensor mounting pad"
-variants = ["sensor mount pad", "mounting bracket pad", "sensor fixing pad"]
-
-[[analysis.canonical_terms]]
-canonical = "wedge interlayer"
-variants = ["wedged acoustic interlayer", "optical wedge layer", "tapered interlayer"]
-
-[[analysis.canonical_terms]]
-canonical = "infrared reflective coating"
-variants = ["ir reflective coating", "heat reflective coating", "infrared coating"]
-
 [openrouter]
 enabled = false
-api_key = "replace-with-your-openrouter-api-key"
-model = "replace-with-openrouter-model-id"
+api_key  = "replace-with-your-openrouter-api-key"
+model    = "replace-with-openrouter-model-id"
 base_url = "https://openrouter.ai/api/v1/chat/completions"
 site_url = "http://localhost:8000"
-site_name = "Patent Analysis Prototype"
-request_timeout_seconds = 30
-
-[sources]
-demo_patents_path = "data/demo_patents.json"
-demo_designs_path = "data/demo_designs.json"
-live_patent_directory = "data/live_patents"
+site_name = "Patent Analysis"
+request_timeout_seconds = 60

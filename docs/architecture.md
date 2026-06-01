@@ -54,6 +54,12 @@ The current revision now uses AI-assisted extraction for patent claims and descr
 - `src/patent_analysis/app.py`
   - FastAPI application, routes, dependency wiring.
 
+- `src/patent_analysis/cli.py`
+  - Command entrypoints for running the server and maintenance tasks.
+
+- `src/patent_analysis/runtime.py`
+  - Shared runtime assembly for settings, repository access, extractor wiring, and demo bootstrap.
+
 - `src/patent_analysis/config.py`
   - Loads `settings.local.toml` or falls back to `settings.example.toml`.
 
@@ -72,9 +78,22 @@ The current revision now uses AI-assisted extraction for patent claims and descr
   - Hybrid feature extraction service.
   - Uses OpenRouter structured JSON extraction for patent claims and descriptions when enabled.
   - Falls back to heuristic extraction when needed.
+  - Assigns each extracted feature to a compact engineering taxonomy for filtering and screening.
 
 - `services/risk.py`
   - Patent-to-product comparison and explainable scoring.
+
+- `services/screening.py`
+  - Patent-to-patent and idea-to-library screening using the same extracted features.
+  - Adds simple engineering review signals such as crowded features, distinctive features, and missing detail prompts.
+
+- `services/ipc_scheme.py`
+  - Parses DPMA IPC scheme XML files.
+  - Converts between compact scheme symbols and engineer-facing IPC codes.
+  - Suggests likely IPC classes for a patent idea or patent text.
+
+- `services/taxonomy.py`
+  - Defines the technical feature families used across extraction, filtering, and screening.
 
 - `services/suggestions.py`
   - Rule-based design-around suggestions, with optional OpenRouter augmentation.
@@ -92,6 +111,9 @@ The current revision now uses AI-assisted extraction for patent claims and descr
 
 - `sources/directory.py`
   - Reads future local patent import files from a folder.
+
+- `sources/dpma_xml.py`
+  - Parses downloaded DPMA-style XML full text files into the shared patent document model.
 
 This adapter pattern is the main extension point for future live sources.
 
@@ -130,6 +152,10 @@ To add a new live source cleanly:
 
 That way, ingestion changes do not affect extraction, scoring, or the UI.
 
+For the current real-patent workflow, the system favors offline import of downloaded DPMA XML packages rather than a live network dependency. This keeps the prototype simple, reproducible, and deployable on a local machine without background jobs.
+
+The IPC scheme is imported separately from the patent library because DPMA's `DE_ExportIPC.xml` is a classification reference file rather than a corpus of patent full texts. In the app, it acts as a searchable classification layer and as a lightweight IPC recommendation aid during screening.
+
 ## 6. Data model direction
 
 The SQLite schema mirrors the requirements:
@@ -152,7 +178,7 @@ This is intentionally close to the requirement document so we keep traceability 
 
 ### Local prototype now
 
-- `python main.py`
+- `./.venv/bin/python main.py`
 - SQLite file in `data/`
 - localhost access only
 

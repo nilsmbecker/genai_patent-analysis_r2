@@ -2,7 +2,7 @@
 
 This repository now contains the first working scaffold for the Fuyao patent analysis project described in the `readme/` folder. The implementation focuses on the documented Phase 1 and Phase 2 requirements first:
 
-- patent ingestion and section splitting,
+- patent ingestion through pdf upload,
 - technical feature extraction with evidence traces,
 - structured storage in SQLite,
 - product design input and feature normalization,
@@ -23,9 +23,9 @@ This repository now contains the first working scaffold for the Fuyao patent ana
 config/                  Editable settings, including OpenRouter configuration
 data/                    Demo patents, demo product designs, SQLite database, future live imports
 docs/                    Architecture and extension notes
-src/patent_analysis/     Application package
+src/patent_analysis/     Application package, CLI, and shared runtime wiring
 tests/                   Core service smoke tests
-main.py                  Python entrypoint for running the server or setup tasks
+main.py                  Thin launcher that points Python at the src/ package
 ```
 
 ## Local setup
@@ -34,14 +34,14 @@ main.py                  Python entrypoint for running the server or setup tasks
 2. Install dependencies:
 
 ```bash
-pip install -r requirements.txt
+./.venv/bin/pip install -r requirements.txt
 ```
 
 3. Adjust the local configuration in `config/settings.local.toml`.
 4. Start the app:
 
 ```bash
-python main.py
+./.venv/bin/python main.py
 ```
 
 Then open [http://127.0.0.1:8000](http://127.0.0.1:8000).
@@ -49,15 +49,60 @@ Then open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 ## Commands
 
 ```bash
-python main.py              # run the web app
-python main.py runserver    # run the web app explicitly
-python main.py init-db      # create the SQLite schema
-python main.py seed-demo    # load demo patents and demo designs
-python main.py test-openrouter
-python main.py test-patent-extraction
-python main.py reextract-patents
-python -m unittest discover -s tests
+./.venv/bin/python main.py              # run the web app
+./.venv/bin/python main.py runserver    # run the web app explicitly
+./.venv/bin/python main.py init-db      # create the SQLite schema
+./.venv/bin/python main.py seed-demo    # load demo patents and demo designs
+./.venv/bin/python main.py import-patents --source dpma_xml
+./.venv/bin/python main.py import-ipc-scheme
+./.venv/bin/python main.py test-openrouter
+./.venv/bin/python main.py test-patent-extraction
+./.venv/bin/python main.py reextract-patents
+./.venv/bin/python -m unittest discover -s tests
 ```
+
+## DPMA workflow
+
+The app now supports a simple real-patent import path for downloaded DPMA XML files.
+
+1. Place DPMA patent XML files in `data/dpma_xml/`.
+2. Import them into SQLite:
+
+```bash
+./.venv/bin/python main.py import-patents --source dpma_xml
+```
+
+3. Open the web UI and use:
+
+- `Patents` to filter by free text, extracted feature term, IPC class, source, and feature family
+- `Screening` to compare a new patent idea or a saved patent against the stored library
+- `Risk Analysis` to compare a product design against a selected patent
+
+## IPC scheme workflow
+
+The current `DE_ExportIPC.xml` file is an official IPC scheme export, not a patent full-text export. The app can import it as a classification reference layer.
+
+```bash
+./.venv/bin/python main.py import-ipc-scheme
+```
+
+After import:
+
+- `IPC` lets you browse and search the official DPMA IPC hierarchy
+- `Screening` suggests likely IPC classes for a patent idea based on its extracted technical features
+- stored patent records can display human-readable IPC labels when they have IPC codes
+
+### Technical feature families
+
+The NLP layer groups extracted features into a few engineering-friendly families:
+
+- `Structure`: physical components, zones, interfaces, and stack-up details
+- `Material`: glass, polymers, coatings, adhesives, films, and other substance choices
+- `Control`: sensors, electrical paths, busbars, controllers, and logic
+- `Manufacturing`: bonding, laminating, assembly, forming, coating, and process steps
+- `Performance`: thermal, optical, acoustic, durability, and other target effects
+
+This keeps filtering and comparison simple while still useful for engineering review.
 
 ## Current demo scope
 
